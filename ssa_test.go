@@ -3,6 +3,7 @@ package astisub_test
 import (
 	"bytes"
 	"io/ioutil"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,4 +163,93 @@ Dialogue: 0,0:00:01.00,0:00:03.50,Default,,0,0,0,,Hello {\i1}world{\i0}!`)))
 	w := &bytes.Buffer{}
 	assert.NoError(t, s.WriteToSSA(w))
 	assert.Contains(t, w.String(), `,Hello {\i1}world{\i0}!`)
+}
+
+// ssaLineText rebuilds the event text of a single-line item
+func ssaLineText(i *astisub.Item) string {
+	var sb strings.Builder
+	for _, item := range i.Lines[0].Items {
+		if item.InlineStyle != nil {
+			sb.WriteString(item.InlineStyle.SSAEffect)
+		}
+		sb.WriteString(item.Text)
+	}
+	return sb.String()
+}
+
+func TestSSATransform(t *testing.T) {
+	// Open the fixture holding two animated events
+	s, err := astisub.OpenFile("./testdata/example-in-transform.ssa")
+	assert.NoError(t, err)
+	assert.Len(t, s.Items, 2)
+
+	// The first event carries two transforms, their order is preserved
+	parts, err := astisub.ParseSSAText(ssaLineText(s.Items[0]))
+	assert.NoError(t, err)
+	transforms := astisub.SSATransforms(parts)
+	assert.Len(t, transforms, 2)
+
+	// The color transform fades to red over the first second
+	assert.True(t, transforms[0].HasTime)
+	assert.Equal(t, time.Duration(0), transforms[0].Start)
+	assert.Equal(t, time.Second, transforms[0].End)
+	assert.Equal(t, 1.0, transforms[0].Acceleration)
+	assert.Len(t, transforms[0].Tags, 1)
+	assert.Equal(t, "1c", transforms[0].Tags[0].Name)
+	assert.Equal(t, &astisub.Color{Red: 255}, transforms[0].Tags[0].Color())
+
+	// The scale transform grows the text over the second one
+	assert.Equal(t, time.Second, transforms[1].Start)
+	assert.Equal(t, 2*time.Second, transforms[1].End)
+	assert.Equal(t, 0.5, transforms[1].Acceleration)
+	assert.Len(t, transforms[1].Tags, 2)
+	x, ok := transforms[1].Tags[0].Scale()
+	assert.True(t, ok)
+	assert.Equal(t, 150.0, x)
+	y, ok := transforms[1].Tags[1].Scale()
+	assert.True(t, ok)
+	assert.Equal(t, 150.0, y)
+
+	// Writing the unmodified parts back reproduces the event text
+	assert.Equal(t, ssaLineText(s.Items[0]), astisub.WriteSSAText(parts))
+
+	// The second event mixes text, a transform and a plain override tag
+	parts2, err := astisub.ParseSSAText(ssaLineText(s.Items[1]))
+	assert.NoError(t, err)
+	assert.Equal(t, ssaLineText(s.Items[1]), astisub.WriteSSAText(parts2))
+	transforms2 := astisub.SSATransforms(parts2)
+	assert.Len(t, transforms2, 1)
+	assert.True(t, transforms2[0].HasTime)
+	assert.Equal(t, 500*time.Millisecond, transforms2[0].Start)
+	assert.Equal(t, 1500*time.Millisecond, transforms2[0].End)
+	assert.Equal(t, 0.0, transforms2[0].Acceleration)
+
+	// Adjust the animation window, the acceleration and the color target
+	transforms[0].End = 2 * time.Second
+	transforms[0].Tags[0] = astisub.NewSSAColorTransformTag("1c", &astisub.Color{Green: 255})
+	transforms[1].Acceleration = 2
+	s.Items[0].Lines[0].Items = []astisub.LineItem{{Text: astisub.WriteSSAText(parts)}}
+
+	// The event timing is untouched
+	assert.Equal(t, time.Second, s.Items[0].StartAt)
+	assert.Equal(t, 5*time.Second, s.Items[0].EndAt)
+
+	// Write
+	w := &bytes.Buffer{}
+	assert.NoError(t, s.WriteToSSA(w))
+	assert.Contains(t, w.String(), `{\an8}{\t(0,2000,1,\1c&H00FF00&)}{\t(1000,2000,2,\fscx150\fscy150)}Fading red and growing`)
+	assert.Contains(t, w.String(), `Shrinking {\t(500,1500,\fscx50)}text{\i1} stays`)
+	assert.Contains(t, w.String(), `00:00:01.00,00:00:05.00`)
+
+	// Re-read: the modified transforms survive the round-trip
+	s2, err := astisub.ReadFromSSA(bytes.NewReader(w.Bytes()))
+	assert.NoError(t, err)
+	assert.Len(t, s2.Items, 2)
+	parts3, err := astisub.ParseSSAText(ssaLineText(s2.Items[0]))
+	assert.NoError(t, err)
+	transforms3 := astisub.SSATransforms(parts3)
+	assert.Len(t, transforms3, 2)
+	assert.Equal(t, 2*time.Second, transforms3[0].End)
+	assert.Equal(t, &astisub.Color{Green: 255}, transforms3[0].Tags[0].Color())
+	assert.Equal(t, 2.0, transforms3[1].Acceleration)
 }
