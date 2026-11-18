@@ -7,7 +7,7 @@ This is a Golang library to manipulate subtitles.
 
 It allows you to manipulate `srt`, `stl`, `ttml`, `ssa/ass`, `webvtt` and `teletext` files for now.
 
-Available operations are `parsing`, `writing`, `applying linear correction`, `syncing`, `fragmenting`, `unfragmenting`, `merging` and `optimizing`.
+Available operations are `parsing`, `writing`, `applying linear correction`, `syncing`, `fragmenting`, `unfragmenting`, `merging`, `optimizing` and `resolving cue conflicts`.
 
 # Installation
 
@@ -45,6 +45,18 @@ s1.Unfragment()
 
 // Apply linear correction
 s1.ApplyLinearCorrection(1*time.Second, 2*time.Second, 5*time.Second, 7*time.Second)
+
+// Resolve the time overlaps between cues sharing a region
+report, _ := s1.ResolveConflicts(astisub.ConflictResolutionOptions{
+    MaxShift:    2 * time.Second, // give up past this displacement
+    MinDuration: 1 * time.Second, // extend short cues
+})
+for _, c := range report.Changes {
+    log.Printf("%s", c)
+}
+for _, u := range report.Unresolved {
+    log.Printf("%s", u)
+}
 
 // Write subtitles
 s1.Write("/path/to/example.srt")
@@ -94,6 +106,7 @@ If **astisub** has been installed properly you can:
 - [x] ordering
 - [x] optimizing
 - [x] linear correction
+- [x] cue conflict resolution
 - [x] .srt
 - [x] .ttml
 - [x] .vtt
