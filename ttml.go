@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -12,6 +13,13 @@ import (
 	"unicode"
 
 	"github.com/asticode/go-astikit"
+)
+
+// TTML time container values.
+// See https://www.w3.org/TR/ttml1/#attribute-timeContainer
+const (
+	ttmlTimeContainerParallel   = "par"
+	ttmlTimeContainerSequential = "seq"
 )
 
 // https://www.w3.org/TR/ttaf1-dfxp/
@@ -45,8 +53,10 @@ type TTMLInBodyDiv struct {
 	XMLName   xml.Name         `xml:"div"`
 	Subtitles []TTMLInSubtitle `xml:"p"`
 
-	Begin *TTMLInDuration `xml:"begin,attr,omitempty"`
-	End   *TTMLInDuration `xml:"end,attr,omitempty"`
+	Begin         *TTMLInDuration `xml:"begin,attr,omitempty"`
+	Duration      *TTMLInDuration `xml:"dur,attr,omitempty"`
+	End           *TTMLInDuration `xml:"end,attr,omitempty"`
+	TimeContainer string          `xml:"timeContainer,attr,omitempty"`
 
 	Region string `xml:"region,attr,omitempty"`
 	Style  string `xml:"style,attr,omitempty"`
@@ -55,6 +65,11 @@ type TTMLInBodyDiv struct {
 type TTMLInBody struct {
 	XMLName xml.Name        `xml:"body"`
 	Divs    []TTMLInBodyDiv `xml:"div"`
+
+	Begin         *TTMLInDuration `xml:"begin,attr,omitempty"`
+	Duration      *TTMLInDuration `xml:"dur,attr,omitempty"`
+	End           *TTMLInDuration `xml:"end,attr,omitempty"`
+	TimeContainer string          `xml:"timeContainer,attr,omitempty"`
 
 	Region string `xml:"region,attr,omitempty"`
 	Style  string `xml:"style,attr,omitempty"`
@@ -324,7 +339,14 @@ func (d *TTMLInDuration) UnmarshalText(i []byte) (err error) {
 			}
 
 			// Update duration
-			d.d = time.Duration(value * float64(timebase.Nanoseconds()))
+			nanos := value * float64(timebase.Nanoseconds())
+			// time.Duration is an int64 nanosecond count: reject values that
+			// would overflow it instead of silently wrapping around.
+			if nanos >= float64(math.MaxInt64) || nanos < float64(math.MinInt64) {
+				err = fmt.Errorf("astisub: time overflow while parsing %q", text)
+				return
+			}
+			d.d = time.Duration(nanos)
 		}
 		return
 	}
@@ -354,6 +376,238 @@ func (d TTMLInDuration) duration() (o time.Duration) {
 	o = d.d
 	if d.frames > 0 && d.framerate > 0 {
 		o += time.Duration(float64(d.frames) / float64(d.framerate) * float64(time.Second.Nanoseconds()))
+	}
+	return
+}
+
+// ttmlSafeAddDuration adds two durations and returns an error if the result
+// overflows time.Duration instead of wrapping around silently.
+func ttmlSafeAddDuration(a, b time.Duration) (time.Duration, error) {
+	if b > 0 && a > math.MaxInt64-b {
+		return 0, fmt.Errorf("astisub: time overflow adding %s and %s", a, b)
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return 0, fmt.Errorf("astisub: time overflow adding %s and %s", a, b)
+	}
+	return a + b, nil
+}
+
+// ttmlIsSequentialContainer reports whether a timeContainer attribute value
+// selects sequential containment ("seq"). Any other value, including the
+// empty string, falls back to parallel ("par").
+func ttmlIsSequentialContainer(v string) bool {
+	return strings.EqualFold(strings.TrimSpace(v), ttmlTimeContainerSequential)
+}
+
+// ttmlResolvedTiming is the absolute timeline interval of a <p>.
+type ttmlResolvedTiming struct {
+	StartAt time.Duration
+	EndAt   time.Duration
+}
+
+// ttmlContainerRange returns the declared absolute range [begin, end] of the
+// parent container. A zero-value boolean means the bound is not declared.
+func ttmlContainerRange(begin, end, dur *TTMLInDuration) (beginAt time.Duration, hasBegin bool, endAt time.Duration, hasEnd bool, err error) {
+	if begin != nil {
+		beginAt = begin.duration()
+		hasBegin = true
+	}
+	if end != nil {
+		endAt = end.duration()
+		hasEnd = true
+	} else if dur != nil {
+		var d = dur.duration()
+		if d < 0 {
+			err = fmt.Errorf("astisub: container has negative duration %s", d)
+			return
+		}
+		if endAt, err = ttmlSafeAddDuration(beginAt, d); err != nil {
+			err = fmt.Errorf("astisub: container end overflows: %w", err)
+			return
+		}
+		hasEnd = true
+	}
+	return
+}
+
+// resolveTTMLDivTimings computes the absolute timeline of every <p> of a <div>.
+//
+// With the default parallel containment ("par", also used when the attribute is
+// absent), begin/end keep being interpreted on the document timeline and a <p>
+// without timing inherits the <div>'s, preserving historical behaviour.
+//
+// With sequential containment ("seq", either set on the <div> or inherited from
+// a <body timeContainer="seq">), each <p> is anchored to the previous <p>'s
+// actual end (or the <div> begin for the first one). An explicit begin/end is
+// an offset relative to that anchor. All arithmetic is overflow safe and
+// malformed timings (missing end, negative duration, overflow or an interval
+// escaping the declared parent range) produce an explicit error rather than
+// overlapping or dropped subtitles.
+func resolveTTMLDivTimings(body *TTMLInBody, div *TTMLInBodyDiv, framerate, tickrate int, inheritedAnchor *time.Duration) (timings []ttmlResolvedTiming, nextAnchor time.Duration, err error) {
+	timings = make([]ttmlResolvedTiming, len(div.Subtitles))
+
+	// Init frame/tick rates on container durations
+	for _, d := range []*TTMLInDuration{div.Begin, div.End, div.Duration} {
+		if d != nil {
+			d.framerate = framerate
+			d.tickrate = tickrate
+		}
+	}
+	if body != nil {
+		for _, d := range []*TTMLInDuration{body.Begin, body.End, body.Duration} {
+			if d != nil {
+				d.framerate = framerate
+				d.tickrate = tickrate
+			}
+		}
+	}
+
+	// A <div> without an explicit timeContainer inherits a sequential <body>.
+	var seq = ttmlIsSequentialContainer(div.TimeContainer)
+	if strings.TrimSpace(div.TimeContainer) == "" && body != nil && ttmlIsSequentialContainer(body.TimeContainer) {
+		seq = true
+	}
+
+	// The chain anchor starts at the container begin. When a sequential body
+	// chains across several <div>s, the caller supplies the previous div end.
+	var anchor time.Duration
+	switch {
+	case div.Begin != nil:
+		anchor = div.Begin.duration()
+	case inheritedAnchor != nil:
+		anchor = *inheritedAnchor
+	}
+	nextAnchor = anchor
+
+	// Declared parent range, if any. The <div>'s own bounds win over the
+	// <body>'s; a missing bound simply isn't checked.
+	var parentBegin, parentEnd time.Duration
+	var hasParentBegin, hasParentEnd bool
+	if parentBegin, hasParentBegin, parentEnd, hasParentEnd, err = ttmlContainerRange(div.Begin, div.End, div.Duration); err != nil {
+		return
+	}
+	if body != nil {
+		bodyBegin, bodyHasBegin, bodyEnd, bodyHasEnd, bodyErr := ttmlContainerRange(body.Begin, body.End, body.Duration)
+		if bodyErr != nil {
+			err = bodyErr
+			return
+		}
+		if !hasParentBegin && bodyHasBegin {
+			parentBegin, hasParentBegin = bodyBegin, true
+		}
+		if !hasParentEnd && bodyHasEnd {
+			parentEnd, hasParentEnd = bodyEnd, true
+		}
+	}
+
+	for i := range div.Subtitles {
+		var ts = &div.Subtitles[i]
+
+		// Init frame/tick rates
+		for _, d := range []*TTMLInDuration{ts.Begin, ts.Duration, ts.End} {
+			if d != nil {
+				d.framerate = framerate
+				d.tickrate = tickrate
+			}
+		}
+
+		// Start and end
+		var start, end time.Duration
+		if !seq {
+			// A <p> without its own timing takes the <div>'s. This historical
+			// inheritance also drives the "no begin or end time" error.
+			if ts.Begin == nil {
+				ts.Begin = div.Begin
+			}
+			if ts.End == nil && ts.Duration == nil {
+				ts.End = div.End
+			}
+			if ts.Begin == nil || (ts.End == nil && ts.Duration == nil) {
+				err = fmt.Errorf("astisub: subtitle %q has no begin or end time", ts.ID)
+				return
+			}
+
+			// Parallel containment: times live on the document timeline.
+			start = ts.Begin.duration()
+			if ts.End != nil {
+				end = ts.End.duration()
+			} else {
+				var d = ts.Duration.duration()
+				if d < 0 {
+					err = fmt.Errorf("astisub: subtitle %q has negative duration %s", ts.ID, d)
+					return
+				}
+				if end, err = ttmlSafeAddDuration(start, d); err != nil {
+					err = fmt.Errorf("astisub: subtitle %q end: %w", ts.ID, err)
+					return
+				}
+			}
+		} else {
+			// Sequential containment: begin (if any) is an offset relative to
+			// the previous actual end, or to the container begin for the first.
+			start = anchor
+			if ts.Begin != nil {
+				if start, err = ttmlSafeAddDuration(anchor, ts.Begin.duration()); err != nil {
+					err = fmt.Errorf("astisub: subtitle %q begin: %w", ts.ID, err)
+					return
+				}
+			}
+
+			switch {
+			case ts.End != nil:
+				// The <p>'s own end is an offset relative to the same anchor.
+				if end, err = ttmlSafeAddDuration(anchor, ts.End.duration()); err != nil {
+					err = fmt.Errorf("astisub: subtitle %q end: %w", ts.ID, err)
+					return
+				}
+			case ts.Duration != nil:
+				var d = ts.Duration.duration()
+				if d < 0 {
+					err = fmt.Errorf("astisub: subtitle %q has negative duration %s", ts.ID, d)
+					return
+				}
+				if end, err = ttmlSafeAddDuration(start, d); err != nil {
+					err = fmt.Errorf("astisub: subtitle %q end: %w", ts.ID, err)
+					return
+				}
+			case div.End != nil:
+				// Inherited absolute container end.
+				end = div.End.duration()
+			case div.Duration != nil:
+				// Absolute container end expressed as begin+dur.
+				end = parentEnd
+			default:
+				err = fmt.Errorf("astisub: subtitle %q in sequential time container has no valid end time", ts.ID)
+				return
+			}
+		}
+
+		// A negative effective duration (end strictly before start) is invalid.
+		if end < start {
+			err = fmt.Errorf("astisub: subtitle %q has negative duration: start %s is after end %s", ts.ID, start, end)
+			return
+		}
+
+		// The interval must stay inside the declared parent time container.
+		if hasParentBegin && start < parentBegin {
+			err = fmt.Errorf("astisub: subtitle %q starts at %s before parent begin %s", ts.ID, start, parentBegin)
+			return
+		}
+		if hasParentEnd && end > parentEnd {
+			err = fmt.Errorf("astisub: subtitle %q ends at %s after parent end %s", ts.ID, end, parentEnd)
+			return
+		}
+
+		timings[i] = ttmlResolvedTiming{StartAt: start, EndAt: end}
+
+		// Next sequential subtitle chains from this actual end.
+		if seq {
+			anchor = end
+		}
+		// Track the container's active end for body-wide chaining.
+		if end > nextAnchor {
+			nextAnchor = end
+		}
 	}
 	return
 }
@@ -413,6 +667,11 @@ func ReadFromTTML(i io.Reader) (o *Subtitles, err error) {
 
 	// Loop through subtitles
 	bodyInlineStyle := ttml.Body.TTMLInStyleAttributes.styleAttributes()
+	var bodySequential = ttmlIsSequentialContainer(ttml.Body.TimeContainer)
+	var bodyAnchor time.Duration
+	if ttml.Body.Begin != nil {
+		bodyAnchor = ttml.Body.Begin.duration()
+	}
 	for _, div := range ttml.Body.Divs {
 		divInlineStyle := div.TTMLInStyleAttributes.styleAttributes()
 
@@ -424,27 +683,25 @@ func ReadFromTTML(i io.Reader) (o *Subtitles, err error) {
 		if div.Style == "" {
 			div.Style = ttml.Body.Style
 		}
-		for _, ts := range div.Subtitles {
-			// A <p> without its own timing takes the <div>'s
-			if ts.Begin == nil {
-				ts.Begin = div.Begin
-			}
-			if ts.End == nil && ts.Duration == nil {
-				ts.End = div.End
-			}
-			if ts.Begin == nil || (ts.End == nil && ts.Duration == nil) {
-				err = fmt.Errorf("astisub: subtitle %q has no begin or end time", ts.ID)
-				return
-			}
 
-			// Init item
-			for _, d := range []*TTMLInDuration{ts.Begin, ts.Duration, ts.End} {
-				if d != nil {
-					d.framerate = ttml.Framerate
-					d.tickrate = ttml.Tickrate
-				}
-			}
+		// A sequential body chains <div>s that do not declare their own begin.
+		var inheritedAnchor *time.Duration
+		if bodySequential && div.Begin == nil {
+			inheritedAnchor = &bodyAnchor
+		}
 
+		// Resolve the timeline of every <p> up front. This implements parallel
+		// (default) and sequential (timeContainer="seq") containment and makes
+		// malformed timings fail before any item is appended.
+		timings, nextAnchor, timingErr := resolveTTMLDivTimings(&ttml.Body, &div, ttml.Framerate, ttml.Tickrate, inheritedAnchor)
+		if timingErr != nil {
+			err = timingErr
+			return
+		}
+		if bodySequential {
+			bodyAnchor = nextAnchor
+		}
+		for i, ts := range div.Subtitles {
 			itemInlineStyle := ts.TTMLInStyleAttributes.styleAttributes()
 
 			// Propagate styles from Body -> Div -> Item.
@@ -461,12 +718,8 @@ func ReadFromTTML(i io.Reader) (o *Subtitles, err error) {
 
 			var s = &Item{
 				InlineStyle: itemInlineStyle,
-				StartAt:     ts.Begin.duration(),
-			}
-			if ts.End != nil {
-				s.EndAt = ts.End.duration()
-			} else {
-				s.EndAt = s.StartAt + ts.Duration.duration()
+				StartAt:     timings[i].StartAt,
+				EndAt:       timings[i].EndAt,
 			}
 
 			// Add region
