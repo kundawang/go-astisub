@@ -48,16 +48,18 @@ type TTMLInBodyDiv struct {
 	Begin *TTMLInDuration `xml:"begin,attr,omitempty"`
 	End   *TTMLInDuration `xml:"end,attr,omitempty"`
 
-	Region string `xml:"region,attr,omitempty"`
-	Style  string `xml:"style,attr,omitempty"`
+	Region   string `xml:"region,attr,omitempty"`
+	Style    string `xml:"style,attr,omitempty"`
+	XMLSpace string `xml:"http://www.w3.org/XML/1998/namespace space,attr,omitempty"`
 	TTMLInStyleAttributes
 }
 type TTMLInBody struct {
 	XMLName xml.Name        `xml:"body"`
 	Divs    []TTMLInBodyDiv `xml:"div"`
 
-	Region string `xml:"region,attr,omitempty"`
-	Style  string `xml:"style,attr,omitempty"`
+	Region   string `xml:"region,attr,omitempty"`
+	Style    string `xml:"style,attr,omitempty"`
+	XMLSpace string `xml:"http://www.w3.org/XML/1998/namespace space,attr,omitempty"`
 	TTMLInStyleAttributes
 }
 
@@ -72,6 +74,7 @@ type TTMLIn struct {
 	Body      TTMLInBody     `xml:"body"`
 	Tickrate  int            `xml:"tickRate,attr"`
 	XMLName   xml.Name       `xml:"tt"`
+	XMLSpace  string         `xml:"http://www.w3.org/XML/1998/namespace space,attr,omitempty"`
 }
 
 // metadata returns the Metadata of the TTML
@@ -185,9 +188,10 @@ type TTMLInSubtitle struct {
 	ID       string          `xml:"id,attr,omitempty"`
 	// We must store inner XML temporarily here since there's no tag to describe both any tag and chardata
 	// Real unmarshal will be done manually afterwards
-	Items  string `xml:",innerxml"`
-	Region string `xml:"region,attr,omitempty"`
-	Style  string `xml:"style,attr,omitempty"`
+	Items    string `xml:",innerxml"`
+	Region   string `xml:"region,attr,omitempty"`
+	Style    string `xml:"style,attr,omitempty"`
+	XMLSpace string `xml:"http://www.w3.org/XML/1998/namespace space,attr,omitempty"`
 	TTMLInStyleAttributes
 }
 
@@ -196,6 +200,8 @@ type TTMLInItems []TTMLInItem
 
 // UnmarshalXML implements the XML unmarshaler interface
 func (i *TTMLInItems) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err error) {
+	space := ttmlStartSpace(start)
+
 	// Get next tokens
 	var t xml.Token
 	for {
@@ -217,7 +223,17 @@ func (i *TTMLInItems) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err 
 			}
 			*i = append(*i, e)
 		} else if b, ok := t.(xml.CharData); ok {
-			if str := string(b); len(strings.TrimSpace(str)) > 0 {
+			// The br token reader emits this marker before the matching br start
+			// element. The start element is decoded below and owns the line break;
+			// keeping the marker here would create a second, empty line.
+			str := string(b)
+			if str == ttmlBRMarker {
+				continue
+			}
+
+			// Default mode keeps the historical behavior: whitespace-only character
+			// data between elements is ignored as formatting. Preserve mode keeps it.
+			if space == ttmlSpacePreserve || strings.TrimSpace(str) != "" {
 				*i = append(*i, TTMLInItem{Text: str})
 			}
 		}
@@ -225,14 +241,16 @@ func (i *TTMLInItems) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err 
 	return nil
 }
 
+const ttmlBRMarker = "\x00" // NUL cannot occur in a well-formed XML text node.
+
 type ttmlXmlTokenReader struct {
 	xmlTokenReader xml.TokenReader
 	holdingToken   xml.Token
 }
 
-// Token implements the TokenReader interface, when it meets the "br" tag, it will hold the token and return a newline
-// instead. This is to work around the fact that the go xml unmarshaler will ignore the "br" tag if it's within a
-// character data field.
+// Token implements the TokenReader interface. When it meets a "br" tag, it
+// holds that token and returns a non-XML marker character instead. The marker
+// is turned into the line-break newline after whitespace normalization.
 func (r *ttmlXmlTokenReader) Token() (xml.Token, error) {
 	if r.holdingToken != nil {
 		returnToken := r.holdingToken
@@ -247,16 +265,24 @@ func (r *ttmlXmlTokenReader) Token() (xml.Token, error) {
 
 	if se, ok := t.(xml.StartElement); ok && strings.ToLower(se.Name.Local) == "br" {
 		r.holdingToken = t
-		return xml.CharData("\n"), nil
+		return xml.CharData(ttmlBRMarker), nil
 	}
 
 	return t, nil
 }
 
 func newTTMLXmlDecoder(s string) *xml.Decoder {
+	return newTTMLXmlDecoderWithSpace(s, "")
+}
+
+func newTTMLXmlDecoderWithSpace(s, space string) *xml.Decoder {
+	wrapper := "<p>" + s + "</p>"
+	if space == ttmlSpacePreserve {
+		wrapper = `<p xml:space="preserve">` + s + "</p>"
+	}
 	return xml.NewTokenDecoder(
 		&ttmlXmlTokenReader{
-			xmlTokenReader: xml.NewDecoder(strings.NewReader("<p>" + s + "</p>")),
+			xmlTokenReader: xml.NewDecoder(strings.NewReader(wrapper)),
 			holdingToken:   nil,
 		},
 	)
@@ -264,8 +290,9 @@ func newTTMLXmlDecoder(s string) *xml.Decoder {
 
 // TTMLInItem represents an input TTML item
 type TTMLInItem struct {
-	Style string `xml:"style,attr,omitempty"`
-	Text  string `xml:",chardata"`
+	Style    string `xml:"style,attr,omitempty"`
+	Text     string `xml:",chardata"`
+	XMLSpace string `xml:"http://www.w3.org/XML/1998/namespace space,attr,omitempty"`
 	TTMLInStyleAttributes
 	XMLName xml.Name
 }
@@ -358,6 +385,79 @@ func (d TTMLInDuration) duration() (o time.Duration) {
 	return
 }
 
+const (
+	ttmlSpaceDefault  = "default"
+	ttmlSpacePreserve = "preserve"
+)
+
+// inheritTTMLSpace applies XML xml:space inheritance and local override rules.
+// Only "preserve" changes the processing mode; every other value behaves as
+// "default", including an empty local value when a parent mode exists.
+func inheritTTMLSpace(parent, local string) string {
+	if local == ttmlSpacePreserve || local == ttmlSpaceDefault {
+		return local
+	}
+	if parent == ttmlSpacePreserve {
+		return ttmlSpacePreserve
+	}
+	return ttmlSpaceDefault
+}
+
+func ttmlStartSpace(start xml.StartElement) string {
+	for _, attr := range start.Attr {
+		if attr.Name.Local == "space" &&
+			(attr.Name.Space == "http://www.w3.org/XML/1998/namespace" || attr.Name.Space == "") {
+			return inheritTTMLSpace(ttmlSpaceDefault, attr.Value)
+		}
+	}
+	return ttmlSpaceDefault
+}
+
+// foldTTMLDefaultWhitespace reproduces the historical TTML indentation removal.
+// It removes a line break together with the following line's leading Unicode
+// whitespace, while leaving ordinary inline spaces untouched. Applying this to
+// each text node is equivalent to the old whole-inner-XML preprocessing for
+// character data without discarding xml:space="preserve" regions first.
+func foldTTMLDefaultWhitespace(s string) string {
+	if !strings.ContainsAny(s, "\n\r") {
+		return s
+	}
+	rs := []rune(s)
+	out := make([]rune, 0, len(rs))
+	for i := 0; i < len(rs); i++ {
+		if rs[i] == '\n' || rs[i] == '\r' {
+			for i+1 < len(rs) && unicode.IsSpace(rs[i+1]) {
+				i++
+			}
+			continue
+		}
+		out = append(out, rs[i])
+	}
+	return string(out)
+}
+
+// ttmlOutputSpace returns the xml:space value needed to make text survive a
+// standards-compliant TTML round trip. Ordinary single boundary spaces keep
+// historical output untouched; whitespace-only and repeated whitespace need
+// "preserve".
+func ttmlOutputSpace(text string) string {
+	if text == "" {
+		return ""
+	}
+	if strings.TrimSpace(text) == "" {
+		return ttmlSpacePreserve
+	}
+	previousSpace := false
+	for _, r := range text {
+		isSpace := unicode.IsSpace(r)
+		if isSpace && previousSpace {
+			return ttmlSpacePreserve
+		}
+		previousSpace = isSpace
+	}
+	return ""
+}
+
 // ReadFromTTML parses a .ttml content
 func ReadFromTTML(i io.Reader) (o *Subtitles, err error) {
 	// Init
@@ -413,8 +513,10 @@ func ReadFromTTML(i io.Reader) (o *Subtitles, err error) {
 
 	// Loop through subtitles
 	bodyInlineStyle := ttml.Body.TTMLInStyleAttributes.styleAttributes()
+	bodySpace := inheritTTMLSpace(ttml.XMLSpace, ttml.Body.XMLSpace)
 	for _, div := range ttml.Body.Divs {
 		divInlineStyle := div.TTMLInStyleAttributes.styleAttributes()
+		divSpace := inheritTTMLSpace(bodySpace, div.XMLSpace)
 
 		// Propagate styles from Body -> Div
 		divInlineStyle.merge(bodyInlineStyle)
@@ -425,6 +527,8 @@ func ReadFromTTML(i io.Reader) (o *Subtitles, err error) {
 			div.Style = ttml.Body.Style
 		}
 		for _, ts := range div.Subtitles {
+			pSpace := inheritTTMLSpace(divSpace, ts.XMLSpace)
+
 			// A <p> without its own timing takes the <div>'s
 			if ts.Begin == nil {
 				ts.Begin = div.Begin
@@ -487,22 +591,17 @@ func ReadFromTTML(i io.Reader) (o *Subtitles, err error) {
 				s.Style = o.Styles[ts.Style]
 			}
 
-			// Remove items identation
-			lines := strings.Split(ts.Items, "\n")
-			for i := 0; i < len(lines); i++ {
-				lines[i] = strings.TrimLeftFunc(lines[i], unicode.IsSpace)
-			}
-
-			// Unmarshal items
+			// Unmarshal items. Whitespace normalization is done per text node so
+			// that xml:space inheritance and local overrides remain visible.
 			var items = TTMLInItems{}
-			if err = newTTMLXmlDecoder(strings.Join(lines, "")).Decode(&items); err != nil {
+			if err = newTTMLXmlDecoderWithSpace(ts.Items, pSpace).Decode(&items); err != nil {
 				err = fmt.Errorf("astisub: unmarshaling items failed: %w", err)
 				return
 			}
 
 			// Loop through texts
 			var l = &Line{}
-			for _, tt := range items {
+			for itemIndex, tt := range items {
 				// New line specified with the "br" tag
 				if strings.ToLower(tt.XMLName.Local) == "br" {
 					s.Lines = append(s.Lines, *l)
@@ -510,10 +609,36 @@ func ReadFromTTML(i io.Reader) (o *Subtitles, err error) {
 					continue
 				}
 
+				// Character data synthesized by the token parser has no element name.
+				// It inherits the paragraph's whitespace mode; actual elements can
+				// override it with their own xml:space attribute.
+				isCharData := tt.XMLName.Local == ""
+				space := pSpace
+				if !isCharData {
+					space = inheritTTMLSpace(pSpace, tt.XMLSpace)
+				}
+
+				text := tt.Text
+				if space != ttmlSpacePreserve {
+					text = foldTTMLDefaultWhitespace(text)
+					if isCharData && itemIndex == 0 {
+						text = strings.TrimLeftFunc(text, unicode.IsSpace)
+					}
+				}
+				// The marker is not a source newline: only turn it into the newline
+				// used by the line-splitting logic after default folding has run.
+				text = strings.ReplaceAll(text, ttmlBRMarker, "\n")
+
+				// Default parsing filters whitespace-only character data in the XML
+				// unmarshaler; keep this guard for tokens produced by other callers.
+				if isCharData && space != ttmlSpacePreserve && strings.TrimSpace(text) == "" {
+					continue
+				}
+
 				// New line decoded as a line break. This can happen if there's a "br" tag within the text since
 				// since the go xml unmarshaler will unmarshal a "br" tag as a line break if the field has the
 				// chardata xml tag.
-				for idx, li := range strings.Split(tt.Text, "\n") {
+				for idx, li := range strings.Split(text, "\n") {
 					// New line
 					if idx > 0 {
 						s.Lines = append(s.Lines, *l)
@@ -541,6 +666,16 @@ func ReadFromTTML(i io.Reader) (o *Subtitles, err error) {
 
 			}
 			s.Lines = append(s.Lines, *l)
+			// Boundary source newlines and br tokens are formatting artifacts rather
+			// than subtitle text. Internal empty lines (for example two consecutive
+			// br elements) are intentionally preserved.
+			s.removeTrailingEmptyLines()
+			for len(s.Lines) > 0 && s.Lines[0].String() == "" {
+				s.Lines = s.Lines[1:]
+			}
+			for len(s.Lines) > 0 && s.Lines[len(s.Lines)-1].String() == "" {
+				s.Lines = s.Lines[:len(s.Lines)-1]
+			}
 
 			// Append subtitle
 			o.Items = append(o.Items, s)
@@ -670,8 +805,9 @@ type TTMLOutSubtitle struct {
 
 // TTMLOutItem represents an output TTML Item
 type TTMLOutItem struct {
-	Style string `xml:"style,attr,omitempty"`
-	Text  string `xml:",chardata"`
+	Style    string `xml:"style,attr,omitempty"`
+	Text     string `xml:",chardata"`
+	XMLSpace string `xml:"http://www.w3.org/XML/1998/namespace space,attr,omitempty"`
 	TTMLOutStyleAttributes
 	XMLName xml.Name
 }
@@ -791,6 +927,7 @@ func (s Subtitles) WriteToTTML(o io.Writer, opts ...WriteToTTMLOption) (err erro
 				// Init ttml item
 				var ttmlItem = TTMLOutItem{
 					Text:                   lineItem.Text,
+					XMLSpace:               ttmlOutputSpace(lineItem.Text),
 					TTMLOutStyleAttributes: ttmlOutStyleAttributesFromStyleAttributes(lineItem.InlineStyle),
 					XMLName:                xml.Name{Local: "span"},
 				}
